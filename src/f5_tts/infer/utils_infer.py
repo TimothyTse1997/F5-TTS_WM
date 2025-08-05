@@ -463,6 +463,7 @@ def infer_batch_process(
 
     generated_waves = []
     spectrograms = []
+    trajectories = []
 
     if len(ref_text[-1].encode("utf-8")) == 1:
         ref_text = ref_text + " "
@@ -487,7 +488,7 @@ def infer_batch_process(
 
         # inference
         with torch.inference_mode():
-            generated, _ = model_obj.sample(
+            generated, trajectory = model_obj.sample(
                 cond=audio,
                 text=final_text_list,
                 duration=duration,
@@ -495,11 +496,14 @@ def infer_batch_process(
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
             )
-            del _
+            # del trajectory
 
             generated = generated.to(torch.float32)  # generated mel spectrogram
             generated = generated[:, ref_audio_len:, :]
             generated = generated.permute(0, 2, 1)
+
+            trajectory = [t.cpu() for t in trajectory]
+
             if mel_spec_type == "vocos":
                 generated_wave = vocoder.decode(generated)
             elif mel_spec_type == "bigvgan":
@@ -512,11 +516,11 @@ def infer_batch_process(
 
             if streaming:
                 for j in range(0, len(generated_wave), chunk_size):
-                    yield generated_wave[j : j + chunk_size], target_sample_rate
+                    yield generated_wave[j : j + chunk_size], target_sample_rate, [t[j : j + chunk_size] for t in trajectories]
             else:
                 generated_cpu = generated[0].cpu().numpy()
                 del generated
-                yield generated_wave, generated_cpu
+                yield generated_wave, generated_cpu, trajectory
 
     if streaming:
         for gen_text in progress.tqdm(gen_text_batches) if progress is not None else gen_text_batches:
@@ -528,9 +532,10 @@ def infer_batch_process(
             for future in progress.tqdm(futures) if progress is not None else futures:
                 result = future.result()
                 if result:
-                    generated_wave, generated_mel_spec = next(result)
+                    generated_wave, generated_mel_spec, trajectory = next(result)
                     generated_waves.append(generated_wave)
                     spectrograms.append(generated_mel_spec)
+                    trajectories.append(trajectory)
 
         if generated_waves:
             if cross_fade_duration <= 0:
@@ -573,7 +578,7 @@ def infer_batch_process(
             # Create a combined spectrogram
             combined_spectrogram = np.concatenate(spectrograms, axis=1)
 
-            yield final_wave, target_sample_rate, combined_spectrogram
+            yield final_wave, target_sample_rate, combined_spectrogram, trajectories
 
         else:
             yield None, target_sample_rate, None

@@ -121,7 +121,7 @@ class F5TTS:
 
         ref_file, ref_text = preprocess_ref_audio_text(ref_file, ref_text)
 
-        wav, sr, spec = infer_process(
+        wav, sr, spec, ts = infer_process(
             ref_file,
             ref_text,
             gen_text,
@@ -146,13 +146,13 @@ class F5TTS:
         if file_spec is not None:
             self.export_spectrogram(spec, file_spec)
 
-        return wav, sr, spec
+        return wav, sr, spec, ts
 
 
 if __name__ == "__main__":
     f5tts = F5TTS()
 
-    wav, sr, spec = f5tts.infer(
+    wav, sr, spec, ts = f5tts.infer(
         ref_file=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
         ref_text="some call me nature, others call me mother nature.",
         gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences.""",
