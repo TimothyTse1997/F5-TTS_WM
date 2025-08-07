@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
+from torchdiffeq._impl.misc import _check_inputs, _flat_to_shape
+from torchdiffeq._impl.odeint import SOLVERS
 
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
@@ -98,7 +100,9 @@ class CFM(nn.Module):
         duplicate_test=False,
         t_inter=0.1,
         edit_mask=None,
+        add_extra_noise_step=None, # add noise at this step
     ):
+
         self.eval()
         # raw wave
 
@@ -158,11 +162,26 @@ class CFM(nn.Module):
 
         # neural ode
 
+
+        def vector_update_with_epsilon(v, epsilon):
+            # experimenting for different noise insertion method
+            scale = torch.norm(v, dim=(1, 2)) / 10
+            print(f"vect update activated: {scale}")
+            v = v + epsilon * scale
+            return v
+
         def fn(t, x):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
             # predict flow (cond)
+
+            if (extra_noise_step is not None) and (t == extra_noise_step):
+                extra_noise = torch.randn_like(x)
+                print("extra noise!!", t, add_extra_noise_step)
+            else:
+                extra_noise = torch.zeros_like(x)
+
             if cfg_strength < 1e-5:
                 pred = self.transformer(
                     x=x,
@@ -174,7 +193,7 @@ class CFM(nn.Module):
                     drop_text=False,
                     cache=True,
                 )
-                return pred
+                return vector_update_with_epsilon(pred, extra_noise)
 
             # predict flow (cond and uncond), for classifier-free guidance
             pred_cfg = self.transformer(
@@ -187,7 +206,7 @@ class CFM(nn.Module):
                 cache=True,
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            return pred + (pred - null_pred) * cfg_strength
+            return vector_update_with_epsilon(pred + (pred - null_pred) * cfg_strength, extra_noise)
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -213,6 +232,12 @@ class CFM(nn.Module):
             t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+            print(t)
+
+        if add_extra_noise_step is not None:
+            extra_noise_step = t[add_extra_noise_step]
+        else:
+            extra_noise_step = None
 
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()

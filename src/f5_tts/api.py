@@ -113,6 +113,7 @@ class F5TTS:
         file_wave=None,
         file_spec=None,
         seed=None,
+        add_extra_noise_step=False
     ):
         if seed is None:
             seed = random.randint(0, sys.maxsize)
@@ -138,6 +139,7 @@ class F5TTS:
             speed=speed,
             fix_duration=fix_duration,
             device=self.device,
+            add_extra_noise_step=add_extra_noise_step
         )
 
         if file_wave is not None:
@@ -150,15 +152,18 @@ class F5TTS:
 
 
 if __name__ == "__main__":
-    f5tts = F5TTS()
-
+    f5tts = F5TTS(model="F5TTS_Base")
+    #gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences."""
+    gen_text= "I go to school by bus, how about you?"
     wav, sr, spec, ts = f5tts.infer(
         ref_file=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
+        #ref_file=str(files("e2_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
         ref_text="some call me nature, others call me mother nature.",
-        gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences.""",
+        gen_text=gen_text,
         file_wave=str(files("f5_tts").joinpath("../../tests/api_out.wav")),
         file_spec=str(files("f5_tts").joinpath("../../tests/api_out.png")),
         seed=None,
+        sway_sampling_coef=-1.0
     )
 
     print("seed :", f5tts.seed)
