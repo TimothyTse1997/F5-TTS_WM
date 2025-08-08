@@ -165,9 +165,9 @@ class CFM(nn.Module):
 
         def vector_update_with_epsilon(v, epsilon):
             # experimenting for different noise insertion method
-            scale = torch.norm(v, dim=(1, 2)) / 10
-            print(f"vect update activated: {scale}")
-            v = v + epsilon * scale
+            #scale = torch.norm(v, dim=(1, 2)) / 10
+            #print(f"vect update activated: {scale}")
+            #v = v + epsilon * scale
             return v
 
         def fn(t, x):
@@ -215,7 +215,9 @@ class CFM(nn.Module):
         for dur in duration:
             if exists(seed):
                 torch.manual_seed(seed)
-            y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
+            y0.append(
+                torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
+
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
         t_start = 0
@@ -241,6 +243,7 @@ class CFM(nn.Module):
 
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()
+        #trajectory = [[init_noise] + t for init_noise, t in zip(y0, trajectory)]
 
         sampled = trajectory[-1]
         out = sampled
@@ -249,6 +252,155 @@ class CFM(nn.Module):
         if exists(vocoder):
             out = out.permute(0, 2, 1)
             out = vocoder(out)
+
+        return out, trajectory
+    
+    def inverse_sample(
+        self,
+        cond: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=1.0,
+        sway_sampling_coef=None,
+        seed: int | None = None,
+        max_duration=4096,
+        vocoder: Callable[[float["b d n"]], float["b nw"]] | None = None,  # noqa: F722
+        use_epss=True,
+        no_ref_audio=False,
+        duplicate_test=False,
+        t_inter=0.1,
+        edit_mask=None,
+        num_inv_loop=5,
+        gen_audio=None,
+        gen_audio_mel=None,
+    ):
+
+        self.eval()
+        # raw wave
+
+        if cond.ndim == 2:
+            cond = self.mel_spec(cond)
+            cond = cond.permute(0, 2, 1)
+            assert cond.shape[-1] == self.num_channels
+
+        if gen_audio is not None and gen_audio.ndim == 2:
+            gen_audio = self.mel_spec(gen_audio)
+            gen_audio = gen_audio.permute(0, 2, 1)
+            assert gen_audio.shape[-1] == self.num_channels
+        else:
+            gen_audio = gen_audio_mel
+
+        cond = cond.to(next(self.parameters()).dtype)
+
+        batch, cond_seq_len, device = *cond.shape[:2], cond.device
+        if not exists(lens):
+            lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
+
+        # text
+
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+
+        # duration
+
+        cond_mask = lens_to_mask(lens)
+        if edit_mask is not None:
+            cond_mask = cond_mask & edit_mask
+
+        if isinstance(duration, int):
+            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
+
+        duration = torch.maximum(
+            torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
+        )  # duration at least text/audio prompt length plus one token, so something is generated
+        duration = duration.clamp(max=max_duration)
+        max_duration = duration.amax()
+
+        # duplicate test corner for inner time step oberservation
+        if duplicate_test:
+            test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+
+        cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
+        if no_ref_audio:
+            cond = torch.zeros_like(cond)
+
+        cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
+        cond_mask = cond_mask.unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, cond, torch.zeros_like(cond)
+        )  # allow direct control (cut cond audio) with lens passed in
+
+        if batch > 1:
+            mask = lens_to_mask(duration)
+        else:  # save memory and speed up, as single inference need no mask currently
+            mask = None
+
+        # neural ode
+        @torch.no_grad()
+        def euler_inv_fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow (cond)
+
+            x_tmp = x
+
+            if cfg_strength < 1e-5:
+                for _ in range(num_inv_loop):
+                    pred = self.transformer(
+                        x=x_tmp,
+                        cond=step_cond,
+                        text=text,
+                        time=t,
+                        mask=mask,
+                        drop_audio_cond=False,
+                        drop_text=False,
+                        cache=True,
+                    )
+                    x_tmp = x - pred
+
+                return -1 * pred
+
+            # predict flow (cond and uncond), for classifier-free guidance
+            
+            for _ in range(num_inv_loop):
+                pred_cfg = self.transformer(
+                    x=x_tmp,
+                    cond=step_cond,
+                    text=text,
+                    time=t,
+                    mask=mask,
+                    cfg_infer=True,
+                    cache=True,
+                )
+                pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+                pred = pred + (pred - null_pred) * cfg_strength
+                x_tmp = x - pred
+            return -1 * pred
+
+        t_start = 0
+
+        if t_start == 0 and use_epss:  # use Empirically Pruned Step Sampling for low NFE
+            t = get_epss_timesteps(steps, device=self.device, dtype=step_cond.dtype)
+        else:
+            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+            t = torch.flip(t, (0,))
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+
+        trajectory = odeint(euler_inv_fn, gen_audio, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+
+        sampled = trajectory[-1]
+        out = sampled
+        out = torch.where(cond_mask, cond, out)
 
         return out, trajectory
 

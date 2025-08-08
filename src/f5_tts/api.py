@@ -1,3 +1,4 @@
+from pathlib import Path
 import random
 import sys
 from importlib.resources import files
@@ -7,6 +8,8 @@ import tqdm
 from cached_path import cached_path
 from hydra.utils import get_class
 from omegaconf import OmegaConf
+
+import torch
 
 from f5_tts.infer.utils_infer import (
     infer_process,
@@ -113,7 +116,8 @@ class F5TTS:
         file_wave=None,
         file_spec=None,
         seed=None,
-        add_extra_noise_step=False
+        add_extra_noise_step=False,
+        trajectory_dir=None
     ):
         if seed is None:
             seed = random.randint(0, sys.maxsize)
@@ -147,6 +151,14 @@ class F5TTS:
 
         if file_spec is not None:
             self.export_spectrogram(spec, file_spec)
+
+        if trajectory_dir is not None:
+            for i, t in enumerate(ts[0]):
+                #print(t)
+                #assert(len(ts) > 1)
+                save_path = Path(trajectory_dir) / f"{i}.pt"
+                torch.save(t, save_path)
+
 
         return wav, sr, spec, ts
 
