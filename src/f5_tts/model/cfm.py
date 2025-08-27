@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
-from torchdiffeq import odeint
+#from torchdiffeq import odeint
 
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
@@ -28,6 +28,26 @@ from f5_tts.model.utils import (
     list_str_to_tensor,
     mask_from_frac_lengths,
 )
+
+def _grid_constructor(t):
+    start_time = t[0]
+    end_time = t[-1]
+
+    niters = torch.ceil((end_time - start_time) / step_size + 1).item()
+    t_infer = torch.arange(0, niters, dtype=t.dtype, device=t.device) * step_size + start_time
+    t_infer[-1] = t[-1]
+
+    return t_infer
+
+def odeint(fn, y0, t, **kwargs):
+    trajectory = []
+    for t0, t1 in zip(t[:-1], t[1:]):
+        dt = t1 - t0
+        dy = fn(t=t0, x=y0, dt=dt, t1=t1)
+        y1 = y0 + dy * dt
+        trajectory.append(y1)
+        y0 = y1
+    return trajectory
 
 
 class CFM(nn.Module):
@@ -78,6 +98,138 @@ class CFM(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @torch.no_grad()
+    def euler_inverse(
+        self,
+        cond: float["b n d"] | float["b nw"],  # noqa: F722
+        gen_audio: float["b n d"] | float["b nw"],  # noqa: F722
+        text: int["b nt"] | list[str],  # noqa: F722
+        duration: int | int["b"],  # noqa: F821
+        *,
+        lens: int["b"] | None = None,  # noqa: F821
+        steps=32,
+        cfg_strength=1.0,
+        sway_sampling_coef=None,
+        seed: int | None = None,
+        vocoder: Callable[[float["b d n"]], float["b nw"]] | None = None,  # noqa: F722
+        use_epss=True,
+        duplicate_test=False,
+        t_inter=0.1,
+        edit_mask=None,
+    ):
+        self.eval()
+        # raw wave
+
+        if cond.ndim == 2:
+            cond = self.mel_spec(cond)
+            cond = cond.permute(0, 2, 1)
+            assert cond.shape[-1] == self.num_channels
+
+        if gen_audio.ndim == 2:
+            print("load gen audio to mel")
+            gen_audio = self.mel_spec(gen_audio)
+
+        gen_audio = gen_audio.permute(0, 2, 1)
+        assert gen_audio.shape[-1] == self.num_channels
+
+        cond = cond.to(next(self.parameters()).dtype)
+        gen_audio = gen_audio.to(next(self.parameters()).dtype)
+
+        batch, cond_seq_len, device = *cond.shape[:2], cond.device
+
+        if not exists(lens):
+            lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
+
+        # text
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+
+        # duration
+        cond_mask = lens_to_mask(lens)
+
+        if edit_mask is not None:
+            cond_mask = cond_mask & edit_mask
+
+        if isinstance(duration, int):
+            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
+
+        max_duration = duration.amax()
+
+        cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
+
+        cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
+        cond_mask = cond_mask.unsqueeze(-1)
+        step_cond = torch.where(
+            cond_mask, cond, torch.zeros_like(cond)
+        )  # allow direct control (cut cond audio) with lens passed in
+
+        if batch > 1:
+            mask = lens_to_mask(duration)
+        else:  # save memory and speed up, as single inference need no mask currently
+            mask = None
+
+        # neural ode
+
+        def inv_fn(t, x, **kwargs):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow (cond)
+            if cfg_strength < 1e-5:
+                pred = self.transformer(
+                    x=x,
+                    cond=step_cond,
+                    text=text,
+                    time=t,
+                    mask=mask,
+                    drop_audio_cond=False,
+                    drop_text=False,
+                    cache=True,
+                )
+                return pred
+
+            # predict flow (cond and uncond), for classifier-free guidance
+            pred_cfg = self.transformer(
+                x=x,
+                cond=step_cond,
+                text=text,
+                time=t,
+                mask=mask,
+                cfg_infer=True,
+                cache=True,
+            )
+            pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+            return pred + (pred - null_pred) * cfg_strength
+
+        # noise input
+        # to make sure batch inference result is same with different batch size, and for sure single inference
+        # still some difference maybe due to convolutional layers
+        # y0 = []
+        # for dur in duration:
+        #     if exists(seed):
+        #         torch.manual_seed(seed)
+        #     y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
+        # y0 = pad_sequence(y0, padding_value=0, batch_first=True)
+
+        t_start = 0
+
+        if t_start == 0 and use_epss:  # use Empirically Pruned Step Sampling for low NFE
+            t = get_epss_timesteps(steps, device=self.device, dtype=step_cond.dtype)
+        else:
+            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        t = torch.flip(t, (-1,)) 
+        print("reverse time stamps: ", t)
+        trajectory = odeint(inv_fn, gen_audio, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
+
+        return trajectory
 
     @torch.no_grad()
     def sample(
@@ -158,7 +310,7 @@ class CFM(nn.Module):
 
         # neural ode
 
-        def fn(t, x):
+        def fn(t, x, **kwargs):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
