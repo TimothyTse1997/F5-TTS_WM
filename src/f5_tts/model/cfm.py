@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+import torch.utils.checkpoint as checkpoint
 
 # from torchdiffeq import odeint
 
@@ -48,11 +49,23 @@ def odeint(fn, y0, t, **kwargs):
     trajectory = []
     for t0, t1 in zip(t[:-1], t[1:]):
         dt = t1 - t0
-        dy = fn(t=t0, x=y0, dt=dt, t1=t1)
+        dy = fn(t=t0, x=y0)
         y1 = y0 + dy * dt
         trajectory.append(y1)
         y0 = y1
     return trajectory
+
+def odeint_grad_checkpoint(fn, y0, t, **kwarg):
+    trajectory = []
+    for t0, t1 in zip(t[:-1], t[1:]):
+        dt = t1 - t0
+        #dy = fn(t=t0, x=y0, dt=dt, t1=t1)
+        dy = checkpoint.checkpoint(fn, t0, y0)
+        y1 = y0 + dy * dt
+        trajectory.append(y1)
+        y0 = y1
+    return trajectory
+
 
 
 class CFM(nn.Module):
@@ -185,7 +198,7 @@ class CFM(nn.Module):
 
         # neural ode
 
-        def inv_fn(t, x, **kwargs):
+        def inv_fn(t, x):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
@@ -270,6 +283,11 @@ class CFM(nn.Module):
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
         return y0
 
+    #def run_checkpoint_fn(self, transformer):
+    #    def custom_forward(**inputs):
+    #        return transformer(**inputs)
+    #    return custom_forward
+
     # @torch.no_grad()
     # def sample(
     def _sample(
@@ -291,6 +309,8 @@ class CFM(nn.Module):
         t_inter=0.1,
         edit_mask=None,
         fix_noise=None,
+        use_grad_checkpoint=False,
+        cache=True
     ):
         self.eval()
         # raw wave
@@ -355,11 +375,16 @@ class CFM(nn.Module):
 
         # neural ode
 
-        def fn(t, x, **kwargs):
+        def fn(t, x):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
             # predict flow (cond)
+            #if not use_grad_checkpoint:
+            #    current_inference_module = self.transformer
+            #else:
+            #    current_inference_module = checkpoint.checkpoint(self.transformer)
+
             if cfg_strength < 1e-5:
                 pred = self.transformer(
                     x=x,
@@ -369,7 +394,7 @@ class CFM(nn.Module):
                     mask=mask,
                     drop_audio_cond=False,
                     drop_text=False,
-                    cache=True,
+                    cache=cache,
                 )
                 return pred
 
@@ -381,10 +406,12 @@ class CFM(nn.Module):
                 time=t,
                 mask=mask,
                 cfg_infer=True,
-                cache=True,
+                cache=cache,
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * cfg_strength
+
+
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -430,8 +457,11 @@ class CFM(nn.Module):
             )
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        if not use_grad_checkpoint:
+            trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        else:
+            trajectory = odeint_grad_checkpoint(fn, y0, t, **self.odeint_kwargs)
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()
 
         sampled = trajectory[-1]
@@ -538,3 +568,4 @@ class CFM(nn.Module):
         loss = loss[rand_span_mask]
 
         return loss.mean(), cond, pred
+
