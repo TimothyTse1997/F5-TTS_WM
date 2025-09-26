@@ -2,6 +2,7 @@ import random
 import sys
 from importlib.resources import files
 from pathlib import Path
+from functools import partial
 
 import soundfile as sf
 import tqdm
@@ -44,14 +45,17 @@ class F5TTS:
         n_fft=1024,
         win_length=1024,
         mel_spec_type="vocos",
+        noise_update_fn=None,
     ):
-        model_cfg = OmegaConf.load(str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
+        model_cfg = OmegaConf.load(
+            str(files("f5_tts").joinpath(f"configs/{model}.yaml"))
+        )
         model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
         model_arc = model_cfg.model.arch
 
         self.mel_spec_type = model_cfg.model.mel_spec.mel_spec_type
         self.target_sample_rate = model_cfg.model.mel_spec.target_sample_rate
-        assert(self.target_sample_rate == target_sample_rate)
+        assert self.target_sample_rate == target_sample_rate
 
         self.ode_method = ode_method
         self.use_ema = use_ema
@@ -73,7 +77,11 @@ class F5TTS:
 
         # Load models
         self.vocoder = load_vocoder(
-            self.mel_spec_type, vocoder_local_path is not None, vocoder_local_path, self.device, hf_cache_dir
+            self.mel_spec_type,
+            vocoder_local_path is not None,
+            vocoder_local_path,
+            self.device,
+            hf_cache_dir,
         )
 
         repo_name, ckpt_step, ckpt_type = "F5-TTS", 1250000, "safetensors"
@@ -91,11 +99,22 @@ class F5TTS:
 
         if not ckpt_file:
             ckpt_file = str(
-                cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}", cache_dir=hf_cache_dir)
+                cached_path(
+                    f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}",
+                    cache_dir=hf_cache_dir,
+                )
             )
         self.ema_model = load_model(
-            model_cls, model_arc, ckpt_file, self.mel_spec_type, vocab_file, self.ode_method, self.use_ema, self.device
+            model_cls,
+            model_arc,
+            ckpt_file,
+            self.mel_spec_type,
+            vocab_file,
+            self.ode_method,
+            self.use_ema,
+            self.device,
         )
+        self.ema_model.noise_update_fn = noise_update_fn
         self.mel_spectrogram = MelSpec(
             n_fft=n_fft,
             hop_length=hop_length,
@@ -168,7 +187,7 @@ class F5TTS:
 
         if file_spec is not None:
             self.export_spectrogram(spec, file_spec)
-        
+
         if dir_traj is not None:
 
             dir_traj = Path(dir_traj)
@@ -176,13 +195,14 @@ class F5TTS:
                 dir_traj.mkdir()
             for batch_id, trajectory in enumerate(trajectories):
                 batch_dir = dir_traj / str(batch_id)
-                if not batch_dir.exists(): batch_dir.mkdir()
+                if not batch_dir.exists():
+                    batch_dir.mkdir()
                 for i, t in enumerate(trajectory):
                     torch.save(t.cpu(), batch_dir / f"{i}.pt")
                     self.export_spectrogram(t[0].cpu(), batch_dir / f"{i}_mel.png")
 
         return wav, sr, spec, trajectories
-    
+
     def inverse(
         self,
         ref_file,
@@ -212,11 +232,13 @@ class F5TTS:
         ref_audio, sr = torchaudio.load(ref_file)
         if gen_audio_mel is not None:
             gen_audio_mel = torch.load(gen_audio_mel)
-            #gen_audio_mel = gen_audio_mel.permute(0, 2, 1)
+            # gen_audio_mel = gen_audio_mel.permute(0, 2, 1)
         if gen_audio is not None:
             gen_audio, source_sample_rate = torchaudio.load(audio_path)
             if source_sample_rate != self.target_sample_rate:
-                resampler = torchaudio.transforms.Resample(source_sample_rate, self.target_sample_rate)
+                resampler = torchaudio.transforms.Resample(
+                    source_sample_rate, self.target_sample_rate
+                )
                 gen_audio = resampler(gen_audio)
 
         trajectory = single_inverse_batch_process(
@@ -248,11 +270,10 @@ class F5TTS:
                 self.export_spectrogram(t[0].cpu(), dir_traj / f"{i}_mel.png")
 
 
-
 if __name__ == "__main__":
     f5tts = F5TTS()
 
-    #wav, sr, spec, _ = f5tts.infer(
+    # wav, sr, spec, _ = f5tts.infer(
     #    ref_file="/home/tst000/projects/tst000/LibriTTS/dev-clean/1272/128104/1272_128104_000006_000008.wav",
     #    ref_text="On the whole, the book will not do.",
     #    gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences.""",
@@ -261,7 +282,7 @@ if __name__ == "__main__":
     #    seed=None,
     #    dir_traj="./api_traj/",
     #    #cfg_strength=0,
-    #)
+    # )
     _ = f5tts.inverse(
         ref_file="/home/tst000/projects/tst000/LibriTTS/dev-clean/1272/128104/1272_128104_000006_000008.wav",
         ref_text="On the whole, the book will not do.",
@@ -269,7 +290,7 @@ if __name__ == "__main__":
         seed=None,
         dir_traj="./api_traj_inverse/",
         gen_audio_mel="/home/tst000/projects/tst000/F5-TTS_WM/api_traj/0/31.pt"
-        #cfg_strength=0,
+        # cfg_strength=0,
     )
 
     print("seed :", f5tts.seed)
