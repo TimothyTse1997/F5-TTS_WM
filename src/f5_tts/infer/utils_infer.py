@@ -463,7 +463,6 @@ def infer_batch_process(
 
     generated_waves = []
     spectrograms = []
-    trajectories = []
 
     if len(ref_text[-1].encode("utf-8")) == 1:
         ref_text = ref_text + " "
@@ -488,7 +487,7 @@ def infer_batch_process(
 
         # inference
         with torch.inference_mode():
-            generated, trajectory = model_obj.sample(
+            generated, _ = model_obj.sample(
                 cond=audio,
                 text=final_text_list,
                 duration=duration,
@@ -496,16 +495,11 @@ def infer_batch_process(
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
             )
-            #del _
+            del _
 
             generated = generated.to(torch.float32)  # generated mel spectrogram
-            trajectory = [t.to(torch.float32) for t in trajectory]
-
             generated = generated[:, ref_audio_len:, :]
-
             generated = generated.permute(0, 2, 1)
-            trajectory = [t.permute(0, 2, 1) for t in trajectory]
-
             if mel_spec_type == "vocos":
                 generated_wave = vocoder.decode(generated)
             elif mel_spec_type == "bigvgan":
@@ -518,11 +512,11 @@ def infer_batch_process(
 
             if streaming:
                 for j in range(0, len(generated_wave), chunk_size):
-                    yield generated_wave[j : j + chunk_size], target_sample_rate, [t[j : j + chunk_size] for t in trajectory]
+                    yield generated_wave[j : j + chunk_size], target_sample_rate
             else:
                 generated_cpu = generated[0].cpu().numpy()
                 del generated
-                yield generated_wave, generated_cpu, trajectory
+                yield generated_wave, generated_cpu
 
     if streaming:
         for gen_text in progress.tqdm(gen_text_batches) if progress is not None else gen_text_batches:
@@ -534,10 +528,9 @@ def infer_batch_process(
             for future in progress.tqdm(futures) if progress is not None else futures:
                 result = future.result()
                 if result:
-                    generated_wave, generated_mel_spec, trajectory = next(result)
+                    generated_wave, generated_mel_spec = next(result)
                     generated_waves.append(generated_wave)
                     spectrograms.append(generated_mel_spec)
-                    trajectories.append(trajectory)
 
         if generated_waves:
             if cross_fade_duration <= 0:
@@ -580,11 +573,12 @@ def infer_batch_process(
             # Create a combined spectrogram
             combined_spectrogram = np.concatenate(spectrograms, axis=1)
 
-            yield final_wave, target_sample_rate, combined_spectrogram, trajectories
+            yield final_wave, target_sample_rate, combined_spectrogram
 
         else:
-            yield None, target_sample_rate, None, None
+            yield None, target_sample_rate, None
 
+<<<<<<< HEAD
 # only support one batch as POC
 def single_inverse_batch_process(
     ref_audio,
@@ -606,6 +600,7 @@ def single_inverse_batch_process(
     chunk_size=2048,
     gen_audio_mel=None,
     gen_audio=None,
+    forward_backward_step=None,
 ):
     audio, sr = ref_audio
     if audio.shape[0] > 1:
@@ -648,11 +643,15 @@ def single_inverse_batch_process(
     ref_audio_len = audio.shape[-1] // hop_length
     if gen_audio_mel is None:
         gen_audio_len = gen_audio.shape[-1] // hop_length
+        duration = ref_audio_len + gen_audio_len
+        print("reverse from audio: ", gen_audio.shape)
+        print("ref_audio_len + gen_audio_len", ref_audio_len, gen_audio_len)
+
     else:
         gen_audio_len = gen_audio.shape[-1]
         print("using full length: ", gen_audio.shape)
         print("ref_audio_len + gen_audio_len", ref_audio_len, gen_audio_len)
-    duration = gen_audio_len
+        duration = gen_audio_len
     #if fix_duration is not None:
     #    duration = int(fix_duration * target_sample_rate / hop_length)
     #else:
@@ -663,7 +662,7 @@ def single_inverse_batch_process(
 
     # inference
     with torch.inference_mode():
-        trajectory = model_obj.euler_inverse(
+        trajectory, masked_trajectory = model_obj.euler_inverse(
             cond=audio,
             gen_audio=gen_audio,
             text=final_text_list,
@@ -671,12 +670,18 @@ def single_inverse_batch_process(
             steps=nfe_step,
             cfg_strength=cfg_strength,
             sway_sampling_coef=sway_sampling_coef,
+            forward_backward_step=forward_backward_step
         )
 
         trajectory = [t.to(torch.float32) for t in trajectory]
         trajectory = [t.permute(0, 2, 1).cpu() for t in trajectory]
 
-        return trajectory
+        #masked_trajectory = [t.to(torch.float32) for t in masked_trajectory]
+        #masked_trajectory = [t.permute(0, 2, 1).cpu() for t in masked_trajectory]
+
+        return trajectory, masked_trajectory
+=======
+>>>>>>> parent of 9bf9990 (clean inversion code, wip using audio file as input (so we can attack))
 
 # remove silence from generated wav
 

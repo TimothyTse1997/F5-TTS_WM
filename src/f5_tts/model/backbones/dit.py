@@ -204,7 +204,9 @@ class DiT(nn.Module):
         else:
             text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
 
+        #print("input_embed (before)", x.shape, cond.shape, text_embed.shape)
         x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+        #print("input_embed (after)", x.shape)
 
         return x
 
