@@ -120,6 +120,12 @@ class CFM(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def get_forward_backward_t(self, t, forward_backward_step):
+        new_traj = torch.zeros((forward_backward_step * 2 + 1), device=t.device, dtype=t.dtype)
+        new_traj[:forward_backward_step] = t[:forward_backward_step]
+        new_traj[forward_backward_step:] = t[:forward_backward_step+1].flip(0)
+        return new_traj
+
     @torch.no_grad()
     def euler_inverse(
         self,
@@ -310,7 +316,8 @@ class CFM(nn.Module):
         edit_mask=None,
         fix_noise=None,
         use_grad_checkpoint=False,
-        cache=True
+        cache=True,
+        forward_backward_step=None
     ):
         self.eval()
         # raw wave
@@ -457,6 +464,10 @@ class CFM(nn.Module):
             )
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+
+        if forward_backward_step is not None:
+            t = self.get_forward_backward_t(t, forward_backward_step)
+        
         if not use_grad_checkpoint:
             trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         else:
